@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interactive Pixel Art</title>
+    <style>
+        canvas {
+            border: 1px solid black;
+            cursor: crosshair;
+        }
+
+        .color-picker {
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+<canvas id="pixelCanvas" width="1000" height="800"></canvas>
+<div class="color-picker">
+    <label for="color">Choose a color: </label>
+    <input type="color" id="color" value="#ff0000">
+</div>
+
+<script>
+    const socketUrl = "ws://8.137.104.25:3250/nano"; // 替换为你的 WebSocket 服务器地址
+    let socket = new WebSocket(socketUrl);
+    const canvas = document.getElementById('pixelCanvas');
+    const ctx = canvas.getContext('2d');
+    const colorPicker = document.getElementById('color');
+
+    // Pixel size (1x1 for each pixel)
+    const pixelSize = 5;
+
+    // Initialize canvas with white background
+    function initCanvas() {
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+    }
+
+    // Set a specific pixel to the chosen color
+    function setPixel(x, y, color) {
+        ctx.fillStyle = color;
+        ctx.fillRect(x * pixelSize, y * pixelSize, pixelSize, pixelSize);
+    }
+
+    // Get the mouse position relative to the canvas
+    function getMousePos(event) {
+        const rect = canvas.getBoundingClientRect();
+        return {
+            x: Math.floor((event.clientX - rect.left) / pixelSize),
+            y: Math.floor((event.clientY - rect.top) / pixelSize)
+        };
+    }
+
+    // Handle mouse click to change the pixel color
+    canvas.addEventListener('click', (event) => {
+        const mousePos = getMousePos(event);
+        const selectedColor = colorPicker.value;
+
+        let data = createPushData("room.draw", {x: mousePos.x, y: mousePos.y, color: selectedColor})
+        //控制台打印xy
+        socket.send(data)
+        // console.log(mousePos.x,mousePos.y);
+        // console.log(selectedColor)
+        // setPixel(mousePos.x, mousePos.y, selectedColor);
+
+    });
+
+    // Initialize the canvas
+    initCanvas();
+
+    let heartBeatInterval = null;
+    let reconnectTimeout = null;
+    const reconnectDelay = 5000; // 重连间隔时间 (毫秒)
+    const heartBeatDelay = 10000; // 心跳发送间隔时间 (毫秒)
+    let reqId = 1;
+
+    function connect() {
+        socket.binaryType = 'arraybuffer';
+        socket.onopen = () => {
+            console.log("WebSocket connection opened.");
+            let encoder = new TextEncoder();
+            let uint8Array = encoder.encode(`{"sys":{"type":"js-websocket","version":"0.0.1","rsa":{}}}`);
+            let byteArray = new Uint8Array(4 + uint8Array.length);
+            byteArray.set([0x01])
+            byteArray.set(storeLengthInBytes(uint8Array.length), 1)
+            byteArray.set(uint8Array, 4)
+            socket.send(byteArray);
+            // startHeartBeat();
+        };
+
+        socket.onmessage = (event) => {
+            // 检查接收到的是二进制消息还是文本消息
+            if (typeof event.data === 'string') {
+                console.log('Received text message:', event.data);
+            } else if (event.data instanceof ArrayBuffer) {
+                // 处理接收到的二进制消息
+                const binaryResponse = new Uint8Array(event.data);
+                switch (binaryResponse[0]) {
+                    case 0x01:
+                        socket.send(new Uint8Array([0x02, 0x00, 0x00, 0x00]));
+
+                        let encoder = new TextEncoder();
+                        // //flag
+                        let flagByte = new Uint8Array([0x00])
+                        let reqByte = encodeVarint128(reqId)
+                        let routeByte = encoder.encode("room.join")
+                        let routeLenByte = numberToVariableBytes(routeByte.length)
+                        let data = encoder.encode("{}")
+
+                        let allByte = new Uint8Array(flagByte.length + reqByte.length + routeLenByte.length + routeByte.length + data.length)
+                        let l = 0
+                        allByte.set(flagByte, l)
+                        l += flagByte.length
+                        allByte.set(reqByte, l)
+                        l += reqByte.length
+                        allByte.set(routeLenByte, l)
+                        l += routeLenByte.length
+                        allByte.set(routeByte, l)
+                        l += routeByte.length
+                        allByte.set(data, l)
+
+                        let byteArray = new Uint8Array(4 + allByte.length);
+                        byteArray.set([0x04])
+                        byteArray.set(storeLengthInBytes(allByte.length), 1)
+                        byteArray.set(allByte, 4)
+                        socket.send(byteArray)
+                    case 0x03:
+                        socket.send(new Uint8Array([0x03, 0x00, 0x00, 0x00]));
+                    case 0x04:
+                        //解析方法名
+                        switch (binaryResponse[4]) {
+                            case 0x06:
+                                //推送消息
+                                //获取route长度
+                                let routeLen = binaryResponse[5]
+                                const slicedArray = binaryResponse.slice(6, 6 + routeLen); // 获取第 6-10 个字节
+                                const str = new TextDecoder().decode(slicedArray);
+                                console.log(str)
+                                switch (str) {
+                                    case "draw":
+                                        //画画,解析剩余数据
+                                        const drawData = new TextDecoder().decode(binaryResponse.slice(6 + routeLen));
+                                        const jsonData = JSON.parse(drawData)
+                                        for (let key in jsonData) {
+                                            setPixel(key/200, key%200, jsonData[key]);
+                                        }
+                                }
+
+                        }
+                }
+            }
+        };
+
+        socket.onclose = (event) => {
+            console.log("WebSocket connection closed:", event);
+            stopHeartBeat();
+            if (event.code !== 1000) { // 1000 表示正常关闭，不需要重连
+                attemptReconnect();
+            }
+        };
+
+        socket.onerror = (error) => {
+            console.log("WebSocket error:", error);
+            stopHeartBeat();
+        };
+    }
+
+    function createPushData(route, obj) {
+        let encoder = new TextEncoder();
+        // //flag
+        let flagByte = new Uint8Array([0x02])
+        let routeByte = encoder.encode(route)
+        let routeLenByte = numberToVariableBytes(routeByte.length)
+        let data = encoder.encode(JSON.stringify(obj))
+
+        let allByte = new Uint8Array(flagByte.length + routeLenByte.length + routeByte.length + data.length)
+        let l = 0
+        allByte.set(flagByte, l)
+        l += flagByte.length
+        allByte.set(routeLenByte, l)
+        l += routeLenByte.length
+        allByte.set(routeByte, l)
+        l += routeByte.length
+        allByte.set(data, l)
+
+        let byteArray = new Uint8Array(4 + allByte.length);
+        byteArray.set([0x04])
+        byteArray.set(storeLengthInBytes(allByte.length), 1)
+        byteArray.set(allByte, 4)
+        return byteArray
+    }
+
+    function encodeVarint128(num) {
+        const result = [];
+        while (num >= 0x80) {
+            result.push((num & 0x7F) | 0x80); // 取 7 位，并将最高位设为 1
+            num >>= 7; // 右移 7 位，处理剩下的部分
+        }
+        result.push(num & 0x7F); // 处理剩下的 7 位
+        reqId++
+        return Uint8Array.from(result); // 返回 Uint8Array
+    }
+
+    function startHeartBeat() {
+        if (heartBeatInterval) return;
+
+        heartBeatInterval = setInterval(() => {
+            if (socket.readyState === WebSocket.OPEN) {
+                socket.send(new Uint8Array([0x03, 0x00, 0x00, 0x00])); // 发送心跳
+            }
+        }, heartBeatDelay);
+    }
+
+    function storeLengthInBytes(len) {
+        // 获取字符串长度
+        const length = len;
+
+        // 检查是否超出3个字节（24位）的存储范围，最大值为 2^24 - 1
+        if (length > 0xFFFFFF) {
+            throw new Error("String length exceeds 3-byte storage capacity.");
+        }
+
+        // 创建一个长度为3的Uint8Array来存储长度
+        const lengthBytes = new Uint8Array(3);
+
+        // 将长度拆分为3个字节，存储在Uint8Array中
+        lengthBytes[0] = (length >> 16) & 0xFF;  // 高位字节
+        lengthBytes[1] = (length >> 8) & 0xFF;   // 中间字节
+        lengthBytes[2] = length & 0xFF;          // 低位字节
+
+        return lengthBytes;
+    }
+
+    function numberToVariableBytes(num) {
+        if (num < 0 || num > 0xFFFFFFFFFF) {
+            throw new Error("Number out of range. Supported range is 0 to 0xFFFFFFFFFF.");
+        }
+
+        // 0 特殊处理
+        if (num === 0) {
+            return new Uint8Array(0);  // 空数组表示0
+        }
+
+        // 创建一个最大长度为5字节的数组
+        const byteArray = [];
+
+        // 将数字逐字节存储到数组，直到用完有效位
+        while (num > 0) {
+            byteArray.push(num & 0xFF);  // 获取低8位
+            num = num >> 8;  // 右移8位（去除已处理的部分）
+        }
+
+        // 返回的字节数组应为大端序（最高位在前），需要反转字节数组
+        return new Uint8Array(byteArray.reverse());
+    }
+
+    function stopHeartBeat() {
+        if (heartBeatInterval) {
+            clearInterval(heartBeatInterval);
+            heartBeatInterval = null;
+        }
+    }
+
+    function attemptReconnect() {
+        if (reconnectTimeout) return;
+
+        reconnectTimeout = setTimeout(() => {
+            console.log("Attempting to reconnect...");
+            connect();
+            reconnectTimeout = null; // 清除重连标记
+        }, reconnectDelay);
+    }
+
+    // 在页面加载时启动连接
+    window.onload = () => {
+        connect();
+    };
+    // 解码 Base64 字符串为原始二进制数据
+    const binaryString = atob(base64String);
+
+    // 将二进制数据转换为 Blob
+    const binaryArray = new Uint8Array(binaryString.split('').map(char => char.charCodeAt(0)));
+    const blob = new Blob([binaryArray], { type: 'application/octet-stream' });
+
+    // 创建一个文件对象，模拟文件上传
+    const file = new File([blob], "abc.jpg", { type: "application/octet-stream" });
+    // 创建 FormData 对象
+    const formData = new FormData();
+    formData.append('file', file);
+
+</script>
+</body>
+</html>
