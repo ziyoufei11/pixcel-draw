@@ -293,7 +293,7 @@ func main() {
 	pip.Inbound().PushBack(stats.inbound)
 
 	log.SetFlags(log.LstdFlags | log.Llongfile)
-	http.Handle("/web/", http.StripPrefix("/web/", http.FileServer(http.Dir("web"))))
+	//http.Handle("/web/", http.StripPrefix("/web/", http.FileServer(http.Dir("web"))))
 	nano.Listen(":3250",
 		nano.WithIsWebsocket(true),
 		nano.WithPipeline(pip),
